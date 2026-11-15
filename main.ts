@@ -30,6 +30,8 @@ const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this baseline reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** Maximum number of dials allowed per prompt. */
+const MAX_DIALS = 6;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -191,41 +193,51 @@ async function handlePromptRequest(req: IncomingMessage, res: ServerResponse, wi
   const adjustedBody = adjustBody(body);
 
   const failures: Array<{ status: number; code: string; model: string | null }> = [];
-  const refusedModels = new Set<string>();
-  let attempts = 0;
+  const ladder = eligibleModelsFor(requires, new Set<string>());
+  let dialCount = 0;
   let successUpstream: Response | null = null;
   let chosenRoute: ModelRow | null = null;
+  let lastStatus = 502;
+  let lastText = 'no eligible model succeeded after failover';
 
-  while (attempts < 3) {
-    attempts += 1;
-    let eligible = eligibleModelsFor(requires, refusedModels);
-    if (eligible.length === 0) {
-        break;
-    }
-    chosenRoute = eligible[0];
+  outer: for (const model of ladder) {
+    let triedThisModel = false;
+    while (true) {
+      if (dialCount >= MAX_DIALS) break outer;
+      dialCount += 1;
 
-    let upstream: Response;
-    const dialBody = wire === 'anthropic' ? anthropicToOpenAI(adjustedBody, chosenRoute.id) : { ...adjustedBody, model: chosenRoute.id };
+      let upstream: Response;
+      let status = 502;
+      let text = '';
+      let code = 'upstream_unreachable';
+      const dialBody = wire === 'anthropic' ? anthropicToOpenAI(adjustedBody, model.id) : { ...adjustedBody, model: model.id };
 
-    try {
-      upstream = await dial(chosenRoute.id, dialBody);
-    } catch (err) {
-      refusedModels.add(chosenRoute.id);
-      failures.push({
-        status: 502,
-        code: 'upstream_unreachable',
-        model: chosenRoute.id,
-      });
-      if (failures.length >= 2 || attempts >= 3) {
+      try {
+        upstream = await dial(model.id, dialBody);
+      } catch (err) {
+        failures.push({
+          status: 502,
+          code: 'upstream_unreachable',
+          model: model.id,
+        });
+        lastStatus = 502;
+        lastText = 'upstream_unreachable';
+
+        if (!triedThisModel) {
+          triedThisModel = true;
+          continue;
+        }
         break;
       }
-      continue;
-    }
 
-    if (!upstream.ok || upstream.body === null) {
-      const status = upstream.status;
-      const text = await upstream.text();
-      let code = 'upstream_error';
+      if (upstream.ok && upstream.body !== null) {
+        successUpstream = upstream;
+        chosenRoute = model;
+        break outer;
+      }
+
+      status = upstream.status;
+      text = await upstream.text();
       try {
         const json = JSON.parse(text);
         if (isRecord(json)) {
@@ -237,29 +249,24 @@ async function handlePromptRequest(req: IncomingMessage, res: ServerResponse, wi
         }
       } catch {}
 
-      if (status === 400 || status === 401) {
-        return refusedWithFailures(res, wire, status, text, failures);
-      }
-
-      refusedModels.add(chosenRoute.id);
       failures.push({
         status,
         code,
-        model: chosenRoute.id,
+        model: model.id,
       });
+      lastStatus = status;
+      lastText = text;
 
-      if (failures.length >= 2 || attempts >= 3) {
-        return refusedWithFailures(res, wire, status, text, failures);
+      if (!triedThisModel && (status === 429 || status >= 500)) {
+        triedThisModel = true;
+        continue;
       }
-      continue;
+      break;
     }
-
-    successUpstream = upstream;
-    break;
   }
 
   if (successUpstream === null || chosenRoute === null) {
-    return refusedWithFailures(res, wire, 502, 'no eligible model succeeded after failover', failures);
+    return refusedWithFailures(res, wire, lastStatus, lastText, failures);
   }
 
   const headers: Record<string, string> = {};
